@@ -1,14 +1,11 @@
 #!/usr/bin/env python3
-"""Generate and validate Bismark XM/XR/XG tags from BAM + reference FASTA.
-
-Goal: reproduce Bismark XM exactly from alignment, XR/XG and reference sequence.
-"""
+"""Generate and validate Bismark XM/XR/XG tags from BAM + reference FASTA."""
 
 from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
-from typing import Callable, Iterable
+from typing import Callable
 
 VALID_XM_CHARS = set(".zZxXhHuU")
 VALID_CONVERSIONS = {"CT", "GA"}
@@ -28,6 +25,13 @@ class ValidationError:
     reason: str
 
 
+_RC = str.maketrans("ACGTNacgtn", "TGCANtgcan")
+
+
+def revcomp(seq: str) -> str:
+    return seq.translate(_RC)[::-1]
+
+
 def strand_id_from_conversions(xr: str, xg: str) -> str:
     mapping = {
         ("CT", "CT"): "OT",
@@ -38,28 +42,116 @@ def strand_id_from_conversions(xr: str, xg: str) -> str:
     return mapping.get((xr, xg), "INVALID")
 
 
-def _ctx_symbol_ct(methylated: bool, d1: str | None, d2: str | None) -> str:
-    if d1 == "G":
-        return "Z" if methylated else "z"
-    if d1 in (None, "N", "X"):
-        return "U" if methylated else "u"
-    if d2 == "G":
-        return "X" if methylated else "x"
-    if d2 in (None, "N", "X"):
-        return "U" if methylated else "u"
-    return "H" if methylated else "h"
+def qpos_to_rpos_from_cigar(record) -> list[int | None]:
+    if record.cigartuples is None:
+        return [None] * len(record.query_sequence or "")
+
+    mapping: list[int | None] = []
+    rpos = record.reference_start
+
+    for op, length in record.cigartuples:
+        if op in (0, 7, 8):  # M, =, X
+            for _ in range(length):
+                mapping.append(rpos)
+                rpos += 1
+        elif op in (1, 4):  # I, S
+            mapping.extend([None] * length)
+        elif op in (2, 3):  # D, N
+            rpos += length
+        elif op in (5, 6):  # H, P
+            continue
+        else:
+            raise ValueError(f"Unsupported CIGAR op: {op}")
+
+    qlen = len(record.query_sequence or "")
+    if len(mapping) < qlen:
+        mapping.extend([None] * (qlen - len(mapping)))
+    elif len(mapping) > qlen:
+        mapping = mapping[:qlen]
+    return mapping
 
 
-def _ctx_symbol_ga(methylated: bool, u1: str | None, u2: str | None) -> str:
-    if u1 == "C":
-        return "Z" if methylated else "z"
-    if u1 in (None, "N", "X"):
-        return "U" if methylated else "u"
-    if u2 == "C":
-        return "X" if methylated else "x"
-    if u2 in (None, "N", "X"):
-        return "U" if methylated else "u"
-    return "H" if methylated else "h"
+def _methylation_call_core(seq: str, genomic: str, xr: str) -> str:
+    seq_bases = list(seq.upper())
+    g = list(genomic.upper())
+    out: list[str] = []
+
+    if xr == "CT":
+        for i, b in enumerate(seq_bases):
+            gb = g[i]
+            if b == gb:
+                if gb == "C":
+                    d1 = g[i + 1]
+                    if d1 == "G":
+                        out.append("Z")
+                    elif d1 in ("N", "X"):
+                        out.append("U")
+                    else:
+                        d2 = g[i + 2]
+                        if d2 == "G":
+                            out.append("X")
+                        elif d2 in ("N", "X"):
+                            out.append("U")
+                        else:
+                            out.append("H")
+                else:
+                    out.append(".")
+            elif gb == "C" and b == "T":
+                d1 = g[i + 1]
+                if d1 == "G":
+                    out.append("z")
+                elif d1 in ("N", "X"):
+                    out.append("u")
+                else:
+                    d2 = g[i + 2]
+                    if d2 == "G":
+                        out.append("x")
+                    elif d2 in ("N", "X"):
+                        out.append("u")
+                    else:
+                        out.append("h")
+            else:
+                out.append(".")
+    elif xr == "GA":
+        for i, b in enumerate(seq_bases):
+            gb = g[i + 2]
+            if b == gb:
+                if gb == "G":
+                    u1 = g[i + 1]
+                    if u1 == "C":
+                        out.append("Z")
+                    elif u1 in ("N", "X"):
+                        out.append("U")
+                    else:
+                        u2 = g[i]
+                        if u2 == "C":
+                            out.append("X")
+                        elif u2 in ("N", "X"):
+                            out.append("U")
+                        else:
+                            out.append("H")
+                else:
+                    out.append(".")
+            elif gb == "G" and b == "A":
+                u1 = g[i + 1]
+                if u1 == "C":
+                    out.append("z")
+                elif u1 in ("N", "X"):
+                    out.append("u")
+                else:
+                    u2 = g[i]
+                    if u2 == "C":
+                        out.append("x")
+                    elif u2 in ("N", "X"):
+                        out.append("u")
+                    else:
+                        out.append("h")
+            else:
+                out.append(".")
+    else:
+        raise ValueError(f"XR must be CT/GA, got {xr}")
+
+    return "".join(out)
 
 
 def generate_xm_from_alignment(
@@ -69,90 +161,54 @@ def generate_xm_from_alignment(
     is_reverse: bool,
     ref_base_fetcher: Callable[[int], str | None],
 ) -> str:
-    """Generate XM in BAM SEQ orientation.
-
-    `qpos_to_rpos` must be length == query length and contain reference positions
-    for each query base (None for insertion/soft-clipped/etc.).
-    """
+    """Reconstruct XM following Bismark methylation_call and SAM-output orientation."""
     if xr not in VALID_CONVERSIONS:
         raise ValueError(f"XR must be CT/GA, got {xr}")
-    if len(qpos_to_rpos) != len(query_seq):
+
+    seq_bam = (query_seq or "").upper()
+    if len(qpos_to_rpos) != len(seq_bam):
         raise ValueError("qpos_to_rpos length must equal query length")
 
-    query_seq = query_seq.upper()
-    out: list[str] = []
+    # Bismark computes methcall on pre-output sequence orientation; for reverse records
+    # the printed sequence is reverse-complemented and XM is reversed afterwards.
+    if is_reverse:
+        seq_work = revcomp(seq_bam)
+        map_work = list(reversed(qpos_to_rpos))
+    else:
+        seq_work = seq_bam
+        map_work = qpos_to_rpos
 
-    def oriented_base(rpos: int, offset: int) -> str | None:
-        pos = rpos - offset if is_reverse else rpos + offset
-        b = ref_base_fetcher(pos)
-        return b.upper() if b else None
-
-    for qpos, qbase in enumerate(query_seq):
-        rpos = qpos_to_rpos[qpos]
-        if rpos is None:
-            out.append(".")
-            continue
-
-        rbase = oriented_base(rpos, 0)
-        if rbase is None:
-            out.append(".")
-            continue
-
-        if xr == "CT":
-            if qbase == rbase and rbase == "C":
-                out.append(_ctx_symbol_ct(True, oriented_base(rpos, +1), oriented_base(rpos, +2)))
-            elif rbase == "C" and qbase == "T":
-                out.append(_ctx_symbol_ct(False, oriented_base(rpos, +1), oriented_base(rpos, +2)))
-            else:
-                out.append(".")
-        else:  # xr == 'GA'
-            if qbase == rbase and rbase == "G":
-                out.append(_ctx_symbol_ga(True, oriented_base(rpos, -1), oriented_base(rpos, -2)))
-            elif rbase == "G" and qbase == "A":
-                out.append(_ctx_symbol_ga(False, oriented_base(rpos, -1), oriented_base(rpos, -2)))
-            else:
-                out.append(".")
-
-    return "".join(out)
-
-
-def qpos_to_rpos_from_cigar(record) -> list[int | None]:
-    """Create query-position -> reference-position mapping from CIGAR.
-
-    Includes soft-clips and insertions as None positions (as Bismark effectively treats
-    these as padded X and emits '.' in XM).
-    """
-    if record.cigartuples is None:
-        return [None] * len(record.query_sequence)
-
-    mapping: list[int | None] = []
-    qpos = 0
-    rpos = record.reference_start
-
-    for op, length in record.cigartuples:
-        if op in (0, 7, 8):  # M, =, X
-            for _ in range(length):
-                mapping.append(rpos)
-                qpos += 1
-                rpos += 1
-        elif op in (1, 4):  # I, S
-            mapping.extend([None] * length)
-            qpos += 1 * length
-        elif op in (2, 3):  # D, N
-            rpos += length
-        elif op in (5, 6):  # H, P
-            continue
+    # Build genomic sequence aligned per query position, using X for I/S (None mapping).
+    aligned_g: list[str] = []
+    mapped_positions: list[int] = []
+    for r in map_work:
+        if r is None:
+            aligned_g.append("X")
         else:
-            raise ValueError(f"Unsupported CIGAR op: {op}")
+            b = ref_base_fetcher(r)
+            aligned_g.append((b or "N").upper())
+            mapped_positions.append(r)
 
-    # keep parity with query sequence length
-    qlen = len(record.query_sequence or "")
-    if len(mapping) < qlen:
-        mapping.extend([None] * (qlen - len(mapping)))
-    elif len(mapping) > qlen:
-        mapping = mapping[:qlen]
+    if not mapped_positions:
+        methcall = "." * len(seq_work)
+    else:
+        first = mapped_positions[0]
+        last = mapped_positions[-1]
 
-    return mapping
+        # In work orientation (+), CT needs +2 at 3' end; GA needs +2 at 5' end.
+        extra_5 = []
+        extra_3 = []
+        if xr == "CT":
+            extra_3 = [ref_base_fetcher(last + 1) or "N", ref_base_fetcher(last + 2) or "N"]
+            genomic = "".join(aligned_g + [b.upper() for b in extra_3])
+        else:  # GA
+            extra_5 = [ref_base_fetcher(first - 2) or "N", ref_base_fetcher(first - 1) or "N"]
+            genomic = "".join([b.upper() for b in extra_5] + aligned_g)
+
+        methcall = _methylation_call_core(seq_work, genomic, xr)
+
+    # Bismark reverses XM for reverse-strand records during SAM output.
+    return methcall[::-1] if is_reverse else methcall
 
 
 def validate_common(record) -> list[str]:
@@ -163,9 +219,8 @@ def validate_common(record) -> list[str]:
         xm = record.get_tag("XM")
         if set(xm) - VALID_XM_CHARS:
             errs.append(f"XM contains invalid chars: {''.join(sorted(set(xm) - VALID_XM_CHARS))}")
-        seq = record.query_sequence or ""
-        if len(xm) != len(seq):
-            errs.append(f"XM length ({len(xm)}) != read length ({len(seq)})")
+        if len(xm) != len(record.query_sequence or ""):
+            errs.append("XM length != query length")
 
     if not record.has_tag("XR"):
         errs.append("missing XR tag")
@@ -196,8 +251,7 @@ def compare_xm_for_record(record, ref_fetcher: Callable[[str, int], str | None])
         is_reverse=record.is_reverse,
         ref_base_fetcher=fetch,
     )
-    observed = record.get_tag("XM")
-    return expected, observed
+    return expected, record.get_tag("XM")
 
 
 def validate_bam_with_reference(path: str, fasta_path: str, max_errors: int = 50) -> tuple[int, int, list[ValidationError]]:
@@ -216,8 +270,8 @@ def validate_bam_with_reference(path: str, fasta_path: str, max_errors: int = 50
         for rec in bam.fetch(until_eof=True):
             if rec.is_unmapped or rec.is_secondary or rec.is_supplementary:
                 continue
-
             checked += 1
+
             for msg in validate_common(rec):
                 errors.append(ValidationError(rec.query_name, msg))
                 if len(errors) >= max_errors:
@@ -236,15 +290,14 @@ def validate_bam_with_reference(path: str, fasta_path: str, max_errors: int = 50
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Generate/validate Bismark XM from BAM + XR/XG + reference")
-    parser.add_argument("bam", help="Input BAM (Bismark output)")
-    parser.add_argument("--reference", required=True, help="Reference FASTA used for Bismark alignment")
+    parser = argparse.ArgumentParser(description="Reconstruct Bismark XM from BAM + XR/XG + reference")
+    parser.add_argument("bam", help="Input BAM")
+    parser.add_argument("--reference", required=True, help="Reference FASTA")
     parser.add_argument("--max-errors", type=int, default=50)
     args = parser.parse_args()
 
-    checked, n_errors, errors = validate_bam_with_reference(args.bam, args.reference, max_errors=args.max_errors)
+    checked, n_errors, errors = validate_bam_with_reference(args.bam, args.reference, args.max_errors)
     print(f"Checked records: {checked}")
-
     if n_errors == 0:
         print("PASS: generated XM is identical to BAM XM for all checked records")
         return 0
