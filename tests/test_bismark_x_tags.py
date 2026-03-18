@@ -16,6 +16,8 @@ from tools.bismark_x_tags import (
     qpos_to_rpos_from_cigar,
     strand_id_from_conversions,
     infer_output_minus_strand,
+    infer_se_minus_strand,
+    infer_pe_minus_strand,
 )
 
 
@@ -29,9 +31,10 @@ class FakeRec:
 
 
 class FakeTaggedRec:
-    def __init__(self, tags, is_reverse=False):
+    def __init__(self, tags, is_reverse=False, is_paired=False):
         self._tags = tags
         self.is_reverse = is_reverse
+        self.is_paired = is_paired
 
     def has_tag(self, tag):
         return tag in self._tags
@@ -81,11 +84,22 @@ class TestTagRules(unittest.TestCase):
 
 
     def test_infer_output_minus_strand_with_ys(self):
-        rec = FakeTaggedRec({"YS": "OB", "XR": "CT", "XG": "GA"}, is_reverse=False)
+        rec = FakeTaggedRec({"YS": "OB", "XR": "CT", "XG": "GA"}, is_reverse=False, is_paired=True)
+        self.assertTrue(infer_pe_minus_strand(rec))
         self.assertTrue(infer_output_minus_strand(rec))
 
-        rec2 = FakeTaggedRec({"YS": "OT", "XR": "CT", "XG": "CT"}, is_reverse=True)
+        rec2 = FakeTaggedRec({"YS": "OT", "XR": "CT", "XG": "CT"}, is_reverse=True, is_paired=True)
+        self.assertFalse(infer_pe_minus_strand(rec2))
         self.assertFalse(infer_output_minus_strand(rec2))
+
+    def test_infer_se_minus_strand(self):
+        se1 = FakeTaggedRec({"XR": "CT", "XG": "GA"}, is_reverse=False, is_paired=False)
+        self.assertTrue(infer_se_minus_strand(se1))
+        self.assertTrue(infer_output_minus_strand(se1))
+
+        se2 = FakeTaggedRec({"XR": "GA", "XG": "GA"}, is_reverse=True, is_paired=False)
+        self.assertFalse(infer_se_minus_strand(se2))
+        self.assertFalse(infer_output_minus_strand(se2))
     def test_generate_xm_ga_unmethylated_cpg(self):
         # GA mode: G->A at read pos2, upstream in oriented ref is C => z
         qseq = "AAAA"

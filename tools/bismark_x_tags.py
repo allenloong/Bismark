@@ -235,12 +235,21 @@ def validate_common(record) -> list[str]:
 
 
 
-def infer_output_minus_strand(record) -> bool:
-    """Infer whether Bismark wrote XM for a '-' strand output record."""
+def infer_se_minus_strand(record) -> bool:
+    """SE: infer '-' output strand from XR/XG exactly as Bismark SE logic."""
     xr = record.get_tag("XR") if record.has_tag("XR") else None
     xg = record.get_tag("XG") if record.has_tag("XG") else None
+    if xr in VALID_CONVERSIONS and xg in VALID_CONVERSIONS:
+        if (xr, xg) in {("CT", "GA"), ("GA", "CT")}:
+            return True
+        if (xr, xg) in {("CT", "CT"), ("GA", "GA")}:
+            return False
+    return bool(record.is_reverse)
 
-    # Prefer YS if present (Bismark strand origin tag).
+
+def infer_pe_minus_strand(record) -> bool:
+    """PE: infer '-' output strand from YS+XR as emitted by Bismark."""
+    xr = record.get_tag("XR") if record.has_tag("XR") else None
     if record.has_tag("YS") and xr in VALID_CONVERSIONS:
         ys = record.get_tag("YS")
         pair_map = {
@@ -251,15 +260,16 @@ def infer_output_minus_strand(record) -> bool:
         }
         if ys in pair_map and xr in pair_map[ys]:
             return pair_map[ys][xr]
+    # fallback for missing YS
+    return infer_se_minus_strand(record)
 
-    # Single-end fallback from XR/XG definition
-    if xr in VALID_CONVERSIONS and xg in VALID_CONVERSIONS:
-        if (xr, xg) in {("CT", "GA"), ("GA", "CT")}:
-            return True
-        if (xr, xg) in {("CT", "CT"), ("GA", "GA")}:
-            return False
 
-    return bool(record.is_reverse)
+def infer_output_minus_strand(record) -> bool:
+    """Dispatch by SE/PE to match Bismark's distinct handling paths."""
+    if getattr(record, "is_paired", False):
+        return infer_pe_minus_strand(record)
+    return infer_se_minus_strand(record)
+
 
 def compare_xm_for_record(record, ref_fetcher: Callable[[str, int], str | None]) -> tuple[str, str]:
     xr = record.get_tag("XR")
