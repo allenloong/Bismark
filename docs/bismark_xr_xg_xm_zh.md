@@ -37,6 +37,7 @@ PE 时两个 mate 的 `XG` 一致，`XR` 在 read1/read2 上分别记录。
 
 见 `tools/bismark_x_tags.py`：
 
+- 读取 FASTA 时自动兼容 `chr1` / `1` 命名差异（若可唯一匹配则自动转换）。
 - `qpos_to_rpos_from_cigar`：从 CIGAR 构建 query 位置到参考位置映射。
 - `generate_xm_from_alignment`：按 Bismark CT/GA 规则逐位生成 XM。
 - `validate_bam_with_reference`：读取 BAM + FASTA，重建 XM 并和 BAM 中 XM 精确比对。

@@ -261,9 +261,30 @@ def validate_bam_with_reference(path: str, fasta_path: str, max_errors: int = 50
 
     with pysam.AlignmentFile(path, "rb") as bam, pysam.FastaFile(fasta_path) as fa:
 
+        fasta_refs = set(fa.references)
+        chrom_cache: dict[str, str | None] = {}
+
+        def resolve_chrom(chrom: str) -> str | None:
+            if chrom in chrom_cache:
+                return chrom_cache[chrom]
+            candidates = [chrom]
+            if chrom.startswith("chr"):
+                candidates.append(chrom[3:])
+            else:
+                candidates.append(f"chr{chrom}")
+            for c in candidates:
+                if c in fasta_refs:
+                    chrom_cache[chrom] = c
+                    return c
+            chrom_cache[chrom] = None
+            return None
+
         def fetch(chrom: str, pos: int) -> str | None:
+            resolved = resolve_chrom(chrom)
+            if resolved is None:
+                return None
             try:
-                return fa.fetch(chrom, pos, pos + 1)
+                return fa.fetch(resolved, pos, pos + 1)
             except Exception:
                 return None
 
