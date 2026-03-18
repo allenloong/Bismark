@@ -169,9 +169,14 @@ def generate_xm_from_alignment(
     if len(qpos_to_rpos) != len(seq_bam):
         raise ValueError("qpos_to_rpos length must equal query length")
 
-    # XM is reconstructed in BAM query orientation (as stored on the record).
-    seq_work = seq_bam
-    map_work = qpos_to_rpos
+    # Mirror Bismark output logic: methcall is computed on internal orientation,
+    # then reversed for '-' output records.
+    if is_reverse:
+        seq_work = revcomp(seq_bam)
+        map_work = list(reversed(qpos_to_rpos))
+    else:
+        seq_work = seq_bam
+        map_work = qpos_to_rpos
 
     # Build genomic sequence aligned per query position, using X for I/S (None mapping).
     aligned_g: list[str] = []
@@ -202,7 +207,7 @@ def generate_xm_from_alignment(
 
         methcall = _methylation_call_core(seq_work, genomic, xr)
 
-    return methcall
+    return methcall[::-1] if is_reverse else methcall
 
 
 def validate_common(record) -> list[str]:
@@ -228,6 +233,34 @@ def validate_common(record) -> list[str]:
     return errs
 
 
+
+
+def infer_output_minus_strand(record) -> bool:
+    """Infer whether Bismark wrote XM for a '-' strand output record."""
+    xr = record.get_tag("XR") if record.has_tag("XR") else None
+    xg = record.get_tag("XG") if record.has_tag("XG") else None
+
+    # Prefer YS if present (Bismark strand origin tag).
+    if record.has_tag("YS") and xr in VALID_CONVERSIONS:
+        ys = record.get_tag("YS")
+        pair_map = {
+            "OT": {"CT": False, "GA": True},
+            "CTOB": {"GA": False, "CT": True},
+            "CTOT": {"GA": True, "CT": False},
+            "OB": {"CT": True, "GA": False},
+        }
+        if ys in pair_map and xr in pair_map[ys]:
+            return pair_map[ys][xr]
+
+    # Single-end fallback from XR/XG definition
+    if xr in VALID_CONVERSIONS and xg in VALID_CONVERSIONS:
+        if (xr, xg) in {("CT", "GA"), ("GA", "CT")}:
+            return True
+        if (xr, xg) in {("CT", "CT"), ("GA", "GA")}:
+            return False
+
+    return bool(record.is_reverse)
+
 def compare_xm_for_record(record, ref_fetcher: Callable[[str, int], str | None]) -> tuple[str, str]:
     xr = record.get_tag("XR")
     chrom = record.reference_name
@@ -242,7 +275,7 @@ def compare_xm_for_record(record, ref_fetcher: Callable[[str, int], str | None])
         query_seq=record.query_sequence or "",
         xr=xr,
         qpos_to_rpos=mapping,
-        is_reverse=record.is_reverse,
+        is_reverse=infer_output_minus_strand(record),
         ref_base_fetcher=fetch,
     )
     return expected, record.get_tag("XM")

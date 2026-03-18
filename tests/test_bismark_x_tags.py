@@ -15,6 +15,7 @@ from tools.bismark_x_tags import (
     generate_xm_from_alignment,
     qpos_to_rpos_from_cigar,
     strand_id_from_conversions,
+    infer_output_minus_strand,
 )
 
 
@@ -24,6 +25,19 @@ class FakeRec:
         self.cigartuples = cigartuples
         self.reference_start = start
 
+
+
+
+class FakeTaggedRec:
+    def __init__(self, tags, is_reverse=False):
+        self._tags = tags
+        self.is_reverse = is_reverse
+
+    def has_tag(self, tag):
+        return tag in self._tags
+
+    def get_tag(self, tag):
+        return self._tags[tag]
 
 class TestTagRules(unittest.TestCase):
     def test_strand_id_mapping(self):
@@ -66,20 +80,12 @@ class TestTagRules(unittest.TestCase):
         self.assertEqual(xm, ".h..")
 
 
-    def test_generate_xm_reverse_uses_record_orientation(self):
-        # BAM query orientation should be used directly; reverse flag should not
-        # implicitly alter query bases in this function.
-        qseq = "ACGT"
-        q2r = [0, 1, 2, 3]
-        ref = "ACGT"
-        xm = generate_xm_from_alignment(
-            query_seq=qseq,
-            xr="CT",
-            qpos_to_rpos=q2r,
-            is_reverse=True,
-            ref_base_fetcher=lambda p: ref[p] if 0 <= p < len(ref) else None,
-        )
-        self.assertEqual(xm, ".Z..")
+    def test_infer_output_minus_strand_with_ys(self):
+        rec = FakeTaggedRec({"YS": "OB", "XR": "CT", "XG": "GA"}, is_reverse=False)
+        self.assertTrue(infer_output_minus_strand(rec))
+
+        rec2 = FakeTaggedRec({"YS": "OT", "XR": "CT", "XG": "CT"}, is_reverse=True)
+        self.assertFalse(infer_output_minus_strand(rec2))
     def test_generate_xm_ga_unmethylated_cpg(self):
         # GA mode: G->A at read pos2, upstream in oriented ref is C => z
         qseq = "AAAA"

@@ -37,6 +37,7 @@ PE 时两个 mate 的 `XG` 一致，`XR` 在 read1/read2 上分别记录。
 
 见 `tools/bismark_x_tags.py`：
 
+- PE 优先使用 `YS`（OT/OB/CTOT/CTOB）+ `XR` 推断输出链方向；缺失时回退到 `XR/XG` 与 FLAG。
 - 读取 FASTA 时自动兼容 `chr1` / `1` 命名差异（若可唯一匹配则自动转换）。
 - `qpos_to_rpos_from_cigar`：从 CIGAR 构建 query 位置到参考位置映射。
 - `generate_xm_from_alignment`：按 Bismark CT/GA 规则逐位生成 XM。
