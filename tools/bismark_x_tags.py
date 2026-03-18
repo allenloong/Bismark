@@ -169,14 +169,9 @@ def generate_xm_from_alignment(
     if len(qpos_to_rpos) != len(seq_bam):
         raise ValueError("qpos_to_rpos length must equal query length")
 
-    # Mirror Bismark SAM output path: methylation call is generated on internal
-    # read orientation, while reverse-strand output is represented by reversed XM.
-    if is_reverse:
-        seq_work = revcomp(seq_bam)
-        map_work = list(reversed(qpos_to_rpos))
-    else:
-        seq_work = seq_bam
-        map_work = qpos_to_rpos
+    # XM is reconstructed in BAM query orientation (as stored on the record).
+    seq_work = seq_bam
+    map_work = qpos_to_rpos
 
     # Build genomic sequence aligned per query position, using X for I/S (None mapping).
     aligned_g: list[str] = []
@@ -207,7 +202,7 @@ def generate_xm_from_alignment(
 
         methcall = _methylation_call_core(seq_work, genomic, xr)
 
-    return methcall[::-1] if is_reverse else methcall
+    return methcall
 
 
 def validate_common(record) -> list[str]:

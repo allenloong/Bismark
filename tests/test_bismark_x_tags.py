@@ -65,6 +65,21 @@ class TestTagRules(unittest.TestCase):
         )
         self.assertEqual(xm, ".h..")
 
+
+    def test_generate_xm_reverse_uses_record_orientation(self):
+        # BAM query orientation should be used directly; reverse flag should not
+        # implicitly alter query bases in this function.
+        qseq = "ACGT"
+        q2r = [0, 1, 2, 3]
+        ref = "ACGT"
+        xm = generate_xm_from_alignment(
+            query_seq=qseq,
+            xr="CT",
+            qpos_to_rpos=q2r,
+            is_reverse=True,
+            ref_base_fetcher=lambda p: ref[p] if 0 <= p < len(ref) else None,
+        )
+        self.assertEqual(xm, ".Z..")
     def test_generate_xm_ga_unmethylated_cpg(self):
         # GA mode: G->A at read pos2, upstream in oriented ref is C => z
         qseq = "AAAA"
