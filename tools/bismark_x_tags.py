@@ -1,29 +1,25 @@
 #!/usr/bin/env python3
-"""Validate Bismark XM/XR/XG tags for single-end and paired-end BAM records.
+"""Generate and validate Bismark XM/XR/XG tags from BAM + reference FASTA.
 
-This script implements tag conventions used in Bismark's Perl source:
-- single-end: `single_end_SAM_output` and `extract_corresponding_genomic_sequence_single_end`
-- paired-end: `paired_end_SAM_output` and `extract_corresponding_genomic_sequence_paired_end`
+Goal: reproduce Bismark XM exactly from alignment, XR/XG and reference sequence.
 """
 
 from __future__ import annotations
 
 import argparse
-from collections import defaultdict
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Callable, Iterable
 
+VALID_XM_CHARS = set(".zZxXhHuU")
+VALID_CONVERSIONS = {"CT", "GA"}
 
 
 def _require_pysam():
     try:
         import pysam  # type: ignore
     except ImportError as exc:  # pragma: no cover
-        raise SystemExit("pysam is required for BAM I/O. Install with: pip install pysam") from exc
+        raise SystemExit("pysam is required for BAM/FASTA I/O. Install with: pip install pysam") from exc
     return pysam
-
-VALID_XM_CHARS = set(".zZxXhHuU")
-VALID_CONVERSIONS = {"CT", "GA"}
 
 
 @dataclass
@@ -40,6 +36,123 @@ def strand_id_from_conversions(xr: str, xg: str) -> str:
         ("CT", "GA"): "OB",
     }
     return mapping.get((xr, xg), "INVALID")
+
+
+def _ctx_symbol_ct(methylated: bool, d1: str | None, d2: str | None) -> str:
+    if d1 == "G":
+        return "Z" if methylated else "z"
+    if d1 in (None, "N", "X"):
+        return "U" if methylated else "u"
+    if d2 == "G":
+        return "X" if methylated else "x"
+    if d2 in (None, "N", "X"):
+        return "U" if methylated else "u"
+    return "H" if methylated else "h"
+
+
+def _ctx_symbol_ga(methylated: bool, u1: str | None, u2: str | None) -> str:
+    if u1 == "C":
+        return "Z" if methylated else "z"
+    if u1 in (None, "N", "X"):
+        return "U" if methylated else "u"
+    if u2 == "C":
+        return "X" if methylated else "x"
+    if u2 in (None, "N", "X"):
+        return "U" if methylated else "u"
+    return "H" if methylated else "h"
+
+
+def generate_xm_from_alignment(
+    query_seq: str,
+    xr: str,
+    qpos_to_rpos: list[int | None],
+    is_reverse: bool,
+    ref_base_fetcher: Callable[[int], str | None],
+) -> str:
+    """Generate XM in BAM SEQ orientation.
+
+    `qpos_to_rpos` must be length == query length and contain reference positions
+    for each query base (None for insertion/soft-clipped/etc.).
+    """
+    if xr not in VALID_CONVERSIONS:
+        raise ValueError(f"XR must be CT/GA, got {xr}")
+    if len(qpos_to_rpos) != len(query_seq):
+        raise ValueError("qpos_to_rpos length must equal query length")
+
+    query_seq = query_seq.upper()
+    out: list[str] = []
+
+    def oriented_base(rpos: int, offset: int) -> str | None:
+        pos = rpos - offset if is_reverse else rpos + offset
+        b = ref_base_fetcher(pos)
+        return b.upper() if b else None
+
+    for qpos, qbase in enumerate(query_seq):
+        rpos = qpos_to_rpos[qpos]
+        if rpos is None:
+            out.append(".")
+            continue
+
+        rbase = oriented_base(rpos, 0)
+        if rbase is None:
+            out.append(".")
+            continue
+
+        if xr == "CT":
+            if qbase == rbase and rbase == "C":
+                out.append(_ctx_symbol_ct(True, oriented_base(rpos, +1), oriented_base(rpos, +2)))
+            elif rbase == "C" and qbase == "T":
+                out.append(_ctx_symbol_ct(False, oriented_base(rpos, +1), oriented_base(rpos, +2)))
+            else:
+                out.append(".")
+        else:  # xr == 'GA'
+            if qbase == rbase and rbase == "G":
+                out.append(_ctx_symbol_ga(True, oriented_base(rpos, -1), oriented_base(rpos, -2)))
+            elif rbase == "G" and qbase == "A":
+                out.append(_ctx_symbol_ga(False, oriented_base(rpos, -1), oriented_base(rpos, -2)))
+            else:
+                out.append(".")
+
+    return "".join(out)
+
+
+def qpos_to_rpos_from_cigar(record) -> list[int | None]:
+    """Create query-position -> reference-position mapping from CIGAR.
+
+    Includes soft-clips and insertions as None positions (as Bismark effectively treats
+    these as padded X and emits '.' in XM).
+    """
+    if record.cigartuples is None:
+        return [None] * len(record.query_sequence)
+
+    mapping: list[int | None] = []
+    qpos = 0
+    rpos = record.reference_start
+
+    for op, length in record.cigartuples:
+        if op in (0, 7, 8):  # M, =, X
+            for _ in range(length):
+                mapping.append(rpos)
+                qpos += 1
+                rpos += 1
+        elif op in (1, 4):  # I, S
+            mapping.extend([None] * length)
+            qpos += 1 * length
+        elif op in (2, 3):  # D, N
+            rpos += length
+        elif op in (5, 6):  # H, P
+            continue
+        else:
+            raise ValueError(f"Unsupported CIGAR op: {op}")
+
+    # keep parity with query sequence length
+    qlen = len(record.query_sequence or "")
+    if len(mapping) < qlen:
+        mapping.extend([None] * (qlen - len(mapping)))
+    elif len(mapping) > qlen:
+        mapping = mapping[:qlen]
+
+    return mapping
 
 
 def validate_common(record) -> list[str]:
@@ -66,117 +179,74 @@ def validate_common(record) -> list[str]:
     return errs
 
 
-def validate_single_end_record(record) -> list[str]:
-    errs = validate_common(record)
-    if errs:
-        return errs
-
+def compare_xm_for_record(record, ref_fetcher: Callable[[str, int], str | None]) -> tuple[str, str]:
     xr = record.get_tag("XR")
-    xg = record.get_tag("XG")
-    is_reverse = record.is_reverse
+    chrom = record.reference_name
+    mapping = qpos_to_rpos_from_cigar(record)
 
-    if not is_reverse and (xr, xg) not in {("CT", "CT"), ("GA", "GA")}:
-        errs.append("single-end forward record must be (XR,XG) in {(CT,CT),(GA,GA)}")
+    def fetch(pos: int) -> str | None:
+        if pos < 0:
+            return None
+        return ref_fetcher(chrom, pos)
 
-    if is_reverse and (xr, xg) not in {("CT", "GA"), ("GA", "CT")}:
-        errs.append("single-end reverse record must be (XR,XG) in {(CT,GA),(GA,CT)}")
-
-    return errs
-
-
-def validate_paired_group(records: Iterable) -> list[ValidationError]:
-    grouped = {1: [], 2: []}
-    errors: list[ValidationError] = []
-
-    for rec in records:
-        mate = 1 if rec.is_read1 else 2 if rec.is_read2 else 0
-        if mate in (1, 2):
-            grouped[mate].append(rec)
-
-    if not grouped[1] or not grouped[2]:
-        qname = next(iter(records)).query_name
-        return [ValidationError(qname, "paired group missing read1/read2")]
-
-    r1 = grouped[1][0]
-    r2 = grouped[2][0]
-
-    for rec in (r1, r2):
-        for msg in validate_common(rec):
-            errors.append(ValidationError(rec.query_name, msg))
-
-    if errors:
-        return errors
-
-    xr1, xg1 = r1.get_tag("XR"), r1.get_tag("XG")
-    xr2, xg2 = r2.get_tag("XR"), r2.get_tag("XG")
-
-    if xg1 != xg2:
-        errors.append(ValidationError(r1.query_name, f"read1/read2 XG mismatch: {xg1} vs {xg2}"))
-        return errors
-
-    if (xr1, xr2, xg1) not in {
-        ("CT", "GA", "CT"),
-        ("GA", "CT", "CT"),
-        ("GA", "CT", "GA"),
-        ("CT", "GA", "GA"),
-    }:
-        errors.append(ValidationError(r1.query_name, f"invalid pair XR/XG combination: R1={xr1}, R2={xr2}, XG={xg1}"))
-
-    return errors
+    expected = generate_xm_from_alignment(
+        query_seq=record.query_sequence or "",
+        xr=xr,
+        qpos_to_rpos=mapping,
+        is_reverse=record.is_reverse,
+        ref_base_fetcher=fetch,
+    )
+    observed = record.get_tag("XM")
+    return expected, observed
 
 
-def validate_bam(path: str, mode: str = "auto", max_errors: int = 50) -> tuple[int, int, list[ValidationError]]:
+def validate_bam_with_reference(path: str, fasta_path: str, max_errors: int = 50) -> tuple[int, int, list[ValidationError]]:
+    pysam = _require_pysam()
     checked = 0
     errors: list[ValidationError] = []
 
-    pysam = _require_pysam()
-    with pysam.AlignmentFile(path, "rb") as bam:
-        if mode == "single":
-            for rec in bam.fetch(until_eof=True):
-                if rec.is_unmapped or rec.is_secondary or rec.is_supplementary:
-                    continue
-                checked += 1
-                for msg in validate_single_end_record(rec):
-                    errors.append(ValidationError(rec.query_name, msg))
-                    if len(errors) >= max_errors:
-                        return checked, len(errors), errors
-        else:
-            by_name: dict[str, list] = defaultdict(list)
-            for rec in bam.fetch(until_eof=True):
-                if rec.is_unmapped or rec.is_secondary or rec.is_supplementary:
-                    continue
-                if mode == "auto" and not rec.is_paired:
-                    checked += 1
-                    for msg in validate_single_end_record(rec):
-                        errors.append(ValidationError(rec.query_name, msg))
-                        if len(errors) >= max_errors:
-                            return checked, len(errors), errors
-                    continue
+    with pysam.AlignmentFile(path, "rb") as bam, pysam.FastaFile(fasta_path) as fa:
 
-                by_name[rec.query_name].append(rec)
+        def fetch(chrom: str, pos: int) -> str | None:
+            try:
+                return fa.fetch(chrom, pos, pos + 1)
+            except Exception:
+                return None
 
-            for qname, recs in by_name.items():
-                checked += len(recs)
-                for err in validate_paired_group(recs):
-                    errors.append(err)
-                    if len(errors) >= max_errors:
-                        return checked, len(errors), errors
+        for rec in bam.fetch(until_eof=True):
+            if rec.is_unmapped or rec.is_secondary or rec.is_supplementary:
+                continue
+
+            checked += 1
+            for msg in validate_common(rec):
+                errors.append(ValidationError(rec.query_name, msg))
+                if len(errors) >= max_errors:
+                    return checked, len(errors), errors
+
+            if not rec.has_tag("XR") or not rec.has_tag("XM"):
+                continue
+
+            exp, obs = compare_xm_for_record(rec, fetch)
+            if exp != obs:
+                errors.append(ValidationError(rec.query_name, f"XM mismatch: expected={exp} observed={obs}"))
+                if len(errors) >= max_errors:
+                    return checked, len(errors), errors
 
     return checked, len(errors), errors
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Validate Bismark XM/XR/XG tag definitions against BAM records")
+    parser = argparse.ArgumentParser(description="Generate/validate Bismark XM from BAM + XR/XG + reference")
     parser.add_argument("bam", help="Input BAM (Bismark output)")
-    parser.add_argument("--mode", choices=["auto", "single", "paired"], default="auto")
+    parser.add_argument("--reference", required=True, help="Reference FASTA used for Bismark alignment")
     parser.add_argument("--max-errors", type=int, default=50)
     args = parser.parse_args()
 
-    checked, n_errors, errors = validate_bam(args.bam, mode=args.mode, max_errors=args.max_errors)
+    checked, n_errors, errors = validate_bam_with_reference(args.bam, args.reference, max_errors=args.max_errors)
     print(f"Checked records: {checked}")
 
     if n_errors == 0:
-        print("PASS: all checked records satisfy XM/XR/XG rules")
+        print("PASS: generated XM is identical to BAM XM for all checked records")
         return 0
 
     print(f"FAIL: found {n_errors} issue(s), showing up to {args.max_errors}")

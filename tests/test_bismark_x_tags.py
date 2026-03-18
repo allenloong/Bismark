@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
-"""Unit tests + optional BAM integration checks for tools/bismark_x_tags.py.
-
-Usage:
-  python tests/test_bismark_x_tags.py
-  python tests/test_bismark_x_tags.py --se-bam sample_SE.bam --pe-bam sample_PE.bam
-"""
+"""Unit tests + optional BAM integration checks for tools/bismark_x_tags.py."""
 
 from __future__ import annotations
 
@@ -17,30 +12,17 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
 from tools.bismark_x_tags import (
+    generate_xm_from_alignment,
+    qpos_to_rpos_from_cigar,
     strand_id_from_conversions,
-    validate_paired_group,
-    validate_single_end_record,
-    validate_bam,
 )
 
 
 class FakeRec:
-    def __init__(self, qname, seq, tags, is_reverse=False, is_read1=False, is_read2=False):
-        self.query_name = qname
+    def __init__(self, seq, cigartuples, start=0):
         self.query_sequence = seq
-        self._tags = tags
-        self.is_reverse = is_reverse
-        self.is_read1 = is_read1
-        self.is_read2 = is_read2
-        self.is_unmapped = False
-        self.is_secondary = False
-        self.is_supplementary = False
-
-    def has_tag(self, tag):
-        return tag in self._tags
-
-    def get_tag(self, tag):
-        return self._tags[tag]
+        self.cigartuples = cigartuples
+        self.reference_start = start
 
 
 class TestTagRules(unittest.TestCase):
@@ -50,47 +32,80 @@ class TestTagRules(unittest.TestCase):
         self.assertEqual(strand_id_from_conversions("GA", "CT"), "CTOT")
         self.assertEqual(strand_id_from_conversions("CT", "GA"), "OB")
 
-    def test_single_end_valid(self):
-        rec = FakeRec("r1", "ACGT", {"XM": "....", "XR": "CT", "XG": "CT"}, is_reverse=False)
-        self.assertEqual(validate_single_end_record(rec), [])
+    def test_cigar_mapping_with_insertion_and_softclip(self):
+        # 2M1I1M1S against ref from 10
+        rec = FakeRec(seq="ACGTT", cigartuples=[(0, 2), (1, 1), (0, 1), (4, 1)], start=10)
+        self.assertEqual(qpos_to_rpos_from_cigar(rec), [10, 11, None, 12, None])
 
-    def test_single_end_invalid_combo(self):
-        rec = FakeRec("r2", "ACGT", {"XM": "....", "XR": "CT", "XG": "GA"}, is_reverse=False)
-        self.assertTrue(validate_single_end_record(rec))
+    def test_generate_xm_ct_cpg(self):
+        # ref: A C G T ; read: A C G T => C at pos1 in CpG context, methylated => Z
+        qseq = "ACGT"
+        q2r = [0, 1, 2, 3]
+        ref = "ACGT"
+        xm = generate_xm_from_alignment(
+            query_seq=qseq,
+            xr="CT",
+            qpos_to_rpos=q2r,
+            is_reverse=False,
+            ref_base_fetcher=lambda p: ref[p] if 0 <= p < len(ref) else None,
+        )
+        self.assertEqual(xm, ".Z..")
 
-    def test_paired_valid(self):
-        r1 = FakeRec("p1", "ACGT", {"XM": "....", "XR": "CT", "XG": "CT"}, is_read1=True)
-        r2 = FakeRec("p1", "ACGT", {"XM": "....", "XR": "GA", "XG": "CT"}, is_read2=True, is_reverse=True)
-        self.assertEqual(validate_paired_group([r1, r2]), [])
+    def test_generate_xm_ct_unmethylated_chh(self):
+        # ref at target C followed by A/A => CHH ; read has T at C pos => h
+        qseq = "ATAA"
+        q2r = [0, 1, 2, 3]
+        ref = "ACAA"
+        xm = generate_xm_from_alignment(
+            query_seq=qseq,
+            xr="CT",
+            qpos_to_rpos=q2r,
+            is_reverse=False,
+            ref_base_fetcher=lambda p: ref[p] if 0 <= p < len(ref) else None,
+        )
+        self.assertEqual(xm, ".h..")
 
-    def test_paired_invalid(self):
-        r1 = FakeRec("p2", "ACGT", {"XM": "....", "XR": "CT", "XG": "CT"}, is_read1=True)
-        r2 = FakeRec("p2", "ACGT", {"XM": "....", "XR": "CT", "XG": "CT"}, is_read2=True, is_reverse=True)
-        self.assertTrue(validate_paired_group([r1, r2]))
+    def test_generate_xm_ga_unmethylated_cpg(self):
+        # GA mode: G->A at read pos2, upstream in oriented ref is C => z
+        qseq = "AAAA"
+        q2r = [0, 1, 2, 3]
+        ref = "CCGA"
+        xm = generate_xm_from_alignment(
+            query_seq=qseq,
+            xr="GA",
+            qpos_to_rpos=q2r,
+            is_reverse=False,
+            ref_base_fetcher=lambda p: ref[p] if 0 <= p < len(ref) else None,
+        )
+        self.assertEqual(xm, "..z.")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--se-bam")
     parser.add_argument("--pe-bam")
-    args, remaining = parser.parse_known_args()
+    parser.add_argument("--reference")
+    args, _ = parser.parse_known_args()
 
     suite = unittest.defaultTestLoader.loadTestsFromTestCase(TestTagRules)
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     rc = 0 if result.wasSuccessful() else 1
 
-    if args.se_bam:
-        checked, nerr, errs = validate_bam(args.se_bam, mode="single")
-        print(f"[SE BAM] checked={checked} errors={nerr}")
-        for e in errs[:10]:
-            print(f"  - {e.qname}: {e.reason}")
-        rc = 1 if nerr else rc
+    if args.reference and (args.se_bam or args.pe_bam):
+        from tools.bismark_x_tags import validate_bam_with_reference
 
-    if args.pe_bam:
-        checked, nerr, errs = validate_bam(args.pe_bam, mode="paired")
-        print(f"[PE BAM] checked={checked} errors={nerr}")
-        for e in errs[:10]:
-            print(f"  - {e.qname}: {e.reason}")
-        rc = 1 if nerr else rc
+        if args.se_bam:
+            checked, nerr, errs = validate_bam_with_reference(args.se_bam, args.reference)
+            print(f"[SE BAM] checked={checked} errors={nerr}")
+            for e in errs[:10]:
+                print(f"  - {e.qname}: {e.reason}")
+            rc = 1 if nerr else rc
+
+        if args.pe_bam:
+            checked, nerr, errs = validate_bam_with_reference(args.pe_bam, args.reference)
+            print(f"[PE BAM] checked={checked} errors={nerr}")
+            for e in errs[:10]:
+                print(f"  - {e.qname}: {e.reason}")
+            rc = 1 if nerr else rc
 
     raise SystemExit(rc)
